@@ -1,8 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using Mycelo.Parsecs;
 using Org.BouncyCastle.Crypto;
@@ -13,6 +13,7 @@ using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Paddings;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Crypto.Modes;
+using Org.BouncyCastle.Crypto.Stream;
 using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Security;
 
@@ -50,11 +51,13 @@ namespace rsautils
             var enc_input = parser_enc.AddString('i', "input", "input plain file (standard input if ommited)");
             var enc_output = parser_enc.AddString('o', "output", "output AES ciphered file (standard output if ommited)");
             var enc_password = parser_enc.AddString('p', "password", "output RSA encrypted password file");
+            var enc_gzip = parser_enc.AddOption('z', "gzip", "compress plain data with GZIP before encryption");
 
             var dec_akey_prv = parser_dec.AddString('k', "key", "input private PEM asymmetric key file");
             var dec_input = parser_dec.AddString('i', "input", "input AES ciphered file (standard input if ommited)");
             var dec_output = parser_dec.AddString('o', "output", "output plain file (standard output if ommited)");
             var dec_password = parser_dec.AddString('p', "password", "input RSA encrypted password file");
+            var dec_gzip = parser_dec.AddOption('z', "gzip", "uncompress plain data with GZIP after decryption");
 
             Console.OutputEncoding = Encoding.ASCII;
 
@@ -121,11 +124,11 @@ namespace rsautils
                                 break;
 
                             case "enc":
-                                Encrypt(enc_akey_pub.String, enc_akey_prv.String, enc_input.String, enc_output.String, enc_password.String);
+                                Encrypt(enc_akey_pub.String, enc_akey_prv.String, enc_input.String, enc_output.String, enc_password.String, enc_gzip.Switched);
                                 break;
 
                             case "dec":
-                                Decrypt(dec_akey_prv.String, dec_password.String, dec_input.String, dec_output.String);
+                                Decrypt(dec_akey_prv.String, dec_password.String, dec_input.String, dec_output.String, dec_gzip.Switched);
                                 break;
                         }
                     }
@@ -190,7 +193,7 @@ namespace rsautils
             }
         }
 
-        private static void Encrypt(string file_akey_pub, string file_akey_prv, string file_input, string file_output, string file_password)
+        private static void Encrypt(string file_akey_pub, string file_akey_prv, string file_input, string file_output, string file_password, bool compress)
         {
             RsaKeyParameters key_param;
             string var_file_password;
@@ -230,41 +233,36 @@ namespace rsautils
                 throw new InvalidParameterException("asymmetric encryption key not provided");
             }
 
-            using (Stream stream_plain = FileOrStandardInput(file_input))
-            using (BinaryReader binary_reader = new BinaryReader(stream_plain))
-            using (Stream stream_cipher = FileOrStandardOutput(file_output))
+            using (Stream stream_input = FileOrStandardInput(file_input))
+            using (Stream stream_output = FileOrStandardOutput(file_output))
+            using (BufferedCryptoStream stream_cripto = new BufferedCryptoStream(stream_output, new PaddedBufferedBlockCipher(new CbcBlockCipher(new AesFastEngine()), new Pkcs7Padding())))
             {
-                PaddedBufferedBlockCipher aes_cipher = new PaddedBufferedBlockCipher(new CbcBlockCipher(new AesFastEngine()), new Pkcs7Padding());
-
-                byte[] password_bytes = new byte[password_size];
-                (new SecureRandom()).NextBytes(password_bytes, 0, password_bytes.Length);
-                password = Encoding.ASCII.GetBytes(Convert.ToBase64String(password_bytes));
-
-                salt = new byte[aes_cipher.GetBlockSize() - salt_prefix.Length];
-                (new SecureRandom()).NextBytes(salt, 0, salt.Length);
-                stream_cipher.Write(salt_prefix, 0, salt_prefix.Length);
-                stream_cipher.Write(salt, 0, salt.Length);
-
-                (skey, iv) = DeriveKey(password, salt, aes_key_size, aes_cipher.GetBlockSize());
-                aes_cipher.Init(true, new ParametersWithIV(new KeyParameter(skey), iv));
-
-                byte[] array_output = new byte[aes_cipher.GetOutputSize(aes_cipher.GetBlockSize()) * 2 * buffer_blocks];
-                do
+                using (GZipStream stream_gzip = new GZipStream(stream_cripto, CompressionMode.Compress))
                 {
-                    byte[] array_input = binary_reader.ReadBytes(aes_cipher.GetBlockSize() * buffer_blocks);
-                    if (array_input.Length > 0)
+                    int block_size = stream_cripto.BlockSize;
+
+                    byte[] password_bytes = new byte[password_size];
+                    (new SecureRandom()).NextBytes(password_bytes, 0, password_bytes.Length);
+                    password = Encoding.ASCII.GetBytes(Convert.ToBase64String(password_bytes));
+
+                    salt = new byte[block_size - salt_prefix.Length];
+                    (new SecureRandom()).NextBytes(salt, 0, salt.Length);
+                    stream_output.Write(salt_prefix, 0, salt_prefix.Length);
+                    stream_output.Write(salt, 0, salt.Length);
+
+                    (skey, iv) = DeriveKey(password, salt, aes_key_size, block_size);
+                    stream_cripto.Init(true, new ParametersWithIV(new KeyParameter(skey), iv));
+
+                    if (compress)
                     {
-                        int bytes_out = aes_cipher.ProcessBytes(array_input, 0, array_input.Length, array_output, 0);
-                        stream_cipher.Write(array_output, 0, bytes_out);
+                        stream_input.CopyTo(stream_gzip);
                     }
                     else
                     {
-                        int bytes_out = aes_cipher.DoFinal(array_output, 0);
-                        stream_cipher.Write(array_output, 0, bytes_out);
-                        break;
+                        stream_input.CopyTo(stream_cripto);
                     }
                 }
-                while (true);
+                stream_cripto.Flush();
             }
 
             using (FileStream stream_skey = new FileStream(var_file_password, FileMode.Create, FileAccess.Write, FileShare.None))
@@ -276,7 +274,7 @@ namespace rsautils
             }
         }
 
-        private static void Decrypt(string file_akey_prv, string file_password, string file_input, string file_output)
+        private static void Decrypt(string file_akey_prv, string file_password, string file_input, string file_output, bool uncompress)
         {
             RsaKeyParameters key_param;
             string var_file_password;
@@ -333,48 +331,51 @@ namespace rsautils
                 password = Encoding.ASCII.GetBytes(str_password.Split('\r', '\n')[0]);
             }
 
-            using (Stream stream_cipher = FileOrStandardInput(file_input))
-            using (Stream stream_plain = FileOrStandardOutput(file_output))
+            using (Stream stream_output = FileOrStandardOutput(file_output))
+            using (MemoryStream memory_stream = new MemoryStream())
+            using (Stream stream_gzip = new GZipStream(memory_stream, CompressionMode.Decompress))
             {
-                PaddedBufferedBlockCipher aes_cipher = new PaddedBufferedBlockCipher(new CbcBlockCipher(new AesFastEngine()), new Pkcs7Padding());
+                Stream stream_target;
 
-                byte[] array_salt_prefix = new byte[salt_prefix.Length];
-                int salt_prefix_count = 0;
-                do
+                if (uncompress)
                 {
-                    salt_prefix_count = stream_cipher.Read(array_salt_prefix, salt_prefix_count, array_salt_prefix.Length - salt_prefix_count);
+                    stream_target = memory_stream;
                 }
-                while (salt_prefix_count < array_salt_prefix.Length);
-
-                salt = new byte[aes_cipher.GetBlockSize() - salt_prefix.Length];
-                int salt_count = 0;
-                do
+                else
                 {
-                    salt_count = stream_cipher.Read(salt, salt_count, salt.Length - salt_count);
+                    stream_target = stream_output;
                 }
-                while (salt_count < salt.Length);
 
-                (skey, iv) = DeriveKey(password, salt, aes_key_size, aes_cipher.GetBlockSize());
-                aes_cipher.Init(false, new ParametersWithIV(new KeyParameter(skey), iv));
-
-                byte[] array_in = new byte[aes_cipher.GetOutputSize(aes_cipher.GetBlockSize()) * buffer_blocks];
-                byte[] array_out = new byte[aes_cipher.GetBlockSize() * buffer_blocks];
-                do
+                using (Stream stream_input = FileOrStandardInput(file_input))
+                using (BufferedCryptoStream stream_cripto = new BufferedCryptoStream(stream_target, new PaddedBufferedBlockCipher(new CbcBlockCipher(new AesFastEngine()), new Pkcs7Padding())))
                 {
-                    int array_in_count = stream_cipher.Read(array_in, 0, array_in.Length);
-                    if (array_in_count > 0)
+                    byte[] array_salt_prefix = new byte[salt_prefix.Length];
+                    int salt_prefix_count = 0;
+                    do
                     {
-                        int bytes_out = aes_cipher.ProcessBytes(array_in, 0, array_in_count, array_out, 0);
-                        stream_plain.Write(array_out, 0, bytes_out);
+                        salt_prefix_count = stream_input.Read(array_salt_prefix, salt_prefix_count, array_salt_prefix.Length - salt_prefix_count);
                     }
-                    else
+                    while (salt_prefix_count < array_salt_prefix.Length);
+
+                    salt = new byte[stream_cripto.BlockSize - salt_prefix.Length];
+                    int salt_count = 0;
+                    do
                     {
-                        int bytes_out = aes_cipher.DoFinal(array_out, 0);
-                        stream_plain.Write(array_out, 0, bytes_out);
-                        break;
+                        salt_count = stream_input.Read(salt, salt_count, salt.Length - salt_count);
                     }
+                    while (salt_count < salt.Length);
+
+                    (skey, iv) = DeriveKey(password, salt, aes_key_size, stream_cripto.BlockSize);
+                    stream_cripto.Init(false, new ParametersWithIV(new KeyParameter(skey), iv));
+                    stream_input.CopyTo(stream_cripto);
+                    stream_cripto.Flush();
                 }
-                while (true);
+
+                if (uncompress)
+                {
+                    memory_stream.Position = 0;
+                    stream_gzip.CopyTo(stream_output);
+                }
             }
         }
 
