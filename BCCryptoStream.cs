@@ -1,17 +1,13 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
-using System.Linq;
-using System.Text;
 using Org.BouncyCastle.Crypto;
 
 namespace Org.BouncyCastle.Crypto.Stream
 {
-    class BufferedCryptoStream : System.IO.Stream
+    public abstract class CryptoStream<T> : System.IO.Stream
     {
         protected System.IO.Stream base_stream;
-        protected IBufferedCipher base_cipher;
+        protected T base_cipher;
 
         public virtual int BlockSize { get { return GetBlockSize(); } }
         public override long Position { get { throw new NotSupportedException(); } set { throw new NotSupportedException(); } }
@@ -20,34 +16,26 @@ namespace Org.BouncyCastle.Crypto.Stream
         public override bool CanSeek { get { return false; } }
         public override bool CanRead { get { return false; } }
 
-        public BufferedCryptoStream(System.IO.Stream stream, IBufferedCipher cipher)
+        public CryptoStream(System.IO.Stream stream, T cipher)
         {
             base_stream = stream;
             base_cipher = cipher;
         }
 
-        public virtual void Init(bool forEncryption, ICipherParameters parameters)
-        {
-            base_cipher.Init(forEncryption, parameters);
-        }
+        public abstract void Init(bool forEncryption, ICipherParameters parameters);
+        public abstract int GetOutputSize(int inputLen);
+        public abstract int GetBlockSize();
 
-        public virtual int GetOutputSize(int inputLen)
-        {
-            return base_cipher.GetOutputSize(inputLen);
-        }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
 
-        public virtual int GetBlockSize()
-        {
-            return base_cipher.GetBlockSize();
-        }
-
-        public override int Read(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
-        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
-        public override void SetLength(long value) { throw new NotSupportedException(); }
+        protected abstract byte[] ProcessBytes(byte[] buffer, int offset, int count);
+        protected abstract byte[] DoFinal();
 
         public override void Write(byte[] buffer, int offset, int count)
         {
-            byte[] bytes_out = base_cipher.ProcessBytes(buffer, offset, count);
+            byte[] bytes_out = ProcessBytes(buffer, offset, count);
 
             if (bytes_out != null)
             {
@@ -57,7 +45,7 @@ namespace Org.BouncyCastle.Crypto.Stream
 
         public override void Flush()
         {
-            byte[] bytes_out = base_cipher.DoFinal();
+            byte[] bytes_out = DoFinal();
 
             if (bytes_out != null)
             {
@@ -68,5 +56,43 @@ namespace Org.BouncyCastle.Crypto.Stream
         }
 
         protected override void Dispose(bool disposing) => base.Dispose(disposing);
+    }
+
+    public class BufferedCryptoStream : Org.BouncyCastle.Crypto.Stream.CryptoStream<IBufferedCipher>
+    {
+        public BufferedCryptoStream(System.IO.Stream stream, IBufferedCipher cipher) : base(stream, cipher) { }
+
+        public override void Init(bool forEncryption, ICipherParameters parameters)
+        {
+            base_cipher.Init(forEncryption, parameters);
+        }
+
+        public override int GetOutputSize(int inputLen)
+            => base_cipher.GetOutputSize(inputLen);
+
+        public override int GetBlockSize()
+            => base_cipher.GetBlockSize();
+
+        protected override byte[] ProcessBytes(byte[] buffer, int offset, int count)
+            => base_cipher.ProcessBytes(buffer, offset, count);
+
+        protected override byte[] DoFinal()
+            => base_cipher.DoFinal();
+    }
+
+    public class AsymmetricCryptoStream : Org.BouncyCastle.Crypto.Stream.CryptoStream<IAsymmetricBlockCipher>
+    {
+        public AsymmetricCryptoStream(System.IO.Stream stream, IAsymmetricBlockCipher cipher) : base(stream, cipher) { }
+
+        public override void Init(bool forEncryption, ICipherParameters parameters)
+            => base_cipher.Init(forEncryption, parameters);
+
+        public override int GetOutputSize(int inputLen) => throw new NotSupportedException();
+        public override int GetBlockSize() => throw new NotSupportedException();
+
+        protected override byte[] ProcessBytes(byte[] buffer, int offset, int count)
+            => base_cipher.ProcessBlock(buffer, offset, count);
+
+        protected override byte[] DoFinal() => null;
     }
 }
