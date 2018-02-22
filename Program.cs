@@ -5,7 +5,9 @@ using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using Mycelo.Parsecs;
+using Org.BouncyCastle.Asn1.X9;
 using Org.BouncyCastle.Crypto;
+using Org.BouncyCastle.Crypto.Agreement;
 using Org.BouncyCastle.Crypto.Digests;
 using Org.BouncyCastle.Crypto.Encodings;
 using Org.BouncyCastle.Crypto.Engines;
@@ -14,6 +16,7 @@ using Org.BouncyCastle.Crypto.Paddings;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Crypto.Modes;
 using Org.BouncyCastle.Crypto.Stream;
+using Org.BouncyCastle.Math;
 using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Security;
 
@@ -23,6 +26,7 @@ namespace rsautils
     {
         private const int aes_key_size = 32;
         private const int rsa_key_size = 4096;
+        private const int ecc_key_size = 256;
         private const int password_length = 16;
         private const int buffer_blocks = 256;
         private static readonly byte[] salt_prefix = Encoding.ASCII.GetBytes("Salted__");
@@ -36,23 +40,32 @@ namespace rsautils
             var parser_gen = parser.AddCommand("gen", "generate PEM asymmetric public+private key pair file");
             var parser_pub = parser.AddCommand("pub", "extract a PEM public key file from key pair file");
             var parser_pwd = parser.AddCommand("pwd", "generate a random password file");
+            var parser_ecc = parser.AddCommand("ecc", "generate an ECDH 'shared secret' password file");
             var parser_rsa = parser.AddCommand("rsa", "RSA-encrypt or decrypt small files (e.g. password file)");
             var parser_aes = parser.AddCommand("aes", "AES-cipher or decipher with password file");
 
             parser_gen.AddOption('?', "help", default);
             parser_pub.AddOption('?', "help", default);
             parser_pwd.AddOption('?', "help", default);
+            parser_ecc.AddOption('?', "help", default);
             parser_rsa.AddOption('?', "help", default);
             parser_aes.AddOption('?', "help", default);
 
             var gen_output = parser_gen.AddString('o', "output", "output file path");
-            var gen_keysize = parser_gen.AddString('s', "size", $"key size (default {rsa_key_size})");
+            var gen_keysize = parser_gen.AddString('l', "length", $"key bit-length (default RSA={rsa_key_size} EC={ecc_key_size})");
+            var gen_choice = parser_gen.AddChoice('r', "asimmetric cryptosystem algorithm (default RSA)");
+            gen_choice.AddItem('r', "rsa", "RSA (Rivest-Shamir-Adleman)");
+            gen_choice.AddItem('e', "ecc", "Elliptic Curve Cryptography");
 
             var pub_input = parser_pub.AddString('i', "input", "input key pair file path");
             var pub_output = parser_pub.AddString('o', "output", "output public key file path");
 
-            var pwd_output = parser_pwd.AddString('o', "output", "output password file path");
-            var pwd_length = parser_pwd.AddString('l', "length", $"password length (default {password_length})");
+            var pwd_output = parser_pwd.AddString('o', "output", "output BASE64 password file path");
+            var pwd_length = parser_pwd.AddString('l', "length", $"password byte-length (default {password_length})");
+
+            var sec_skey_prv = parser_ecc.AddString('y', "yours", "your ECC private key file path");
+            var sec_skey_pub = parser_ecc.AddString('t', "theirs", "the other part's ECC public key file path");
+            var sec_output = parser_ecc.AddString('o', "output 'shared-secret' BASE64 password file path");
 
             var rsa_akey_pub = parser_rsa.AddString('k', "key", "input public PEM file path");
             var rsa_akey_prv = parser_rsa.AddString('2', "pair", "input public+private pair PEM file path");
@@ -62,8 +75,9 @@ namespace rsautils
             rsa_choice.AddItem('e', "encrypt", "RSA-encrypt with a public key");
             rsa_choice.AddItem('d', "decrypt", "RSA-decrypt with a private key or key pair");
 
-            var aes_pwd_file = parser_aes.AddString('p', "passfile", "input password file path");
-            var aes_pwd_str = parser_aes.AddString('s', "string", "input password string");
+            var aes_pwd_file = parser_aes.AddString('p', "passfile", "input BASE64 password file path");
+            var aes_pwd_b64 = parser_aes.AddString('b', "base64", "input BASE64 password string");
+            var aes_pwd_str = parser_aes.AddString('a', "ascii", "input plain ASCII 7-bit password string");
             var aes_input = parser_aes.AddString('i', "input", "input data file path");
             var aes_output = parser_aes.AddString('o', "output", "output data file path");
             var aes_gzip = parser_aes.AddOption('z', "gzip", "enable GZIP compression/decompression");
@@ -77,48 +91,55 @@ namespace rsautils
             {
                 if ((args.Length == 0) || parser['?'] || (parser.Command == parser))
                 {
-                    Console.WriteLine("RSAUTILS <command> <command-options>|--help\r\n");
+                    Console.WriteLine("PARAMETERS: <command> <command-options>|--help\r\n");
                     Console.WriteLine(parser.HelpTextBuilder(4, false).ToString());
                     Console.WriteLine($">>> passing a '{file_std}' char for a file name means standard input/output");
                     Console.WriteLine();
-                    Console.WriteLine("ENCRYPTION EXAMPLE:");
-                    Console.WriteLine("$ rsautils gen --output=PRIVATE.pem");
-                    Console.WriteLine("$ rsautils pub --input=PRIVATE.pem --output=PUBLIC.pem");
-                    Console.WriteLine("$ rsautils pwd --output=PASSWORD.txt");
-                    Console.WriteLine("$ rsautils aes --encrypt --passfile=PASSWORD.txt --input=PLAIN.txt --output=CIPHERED.bin");
-                    Console.WriteLine("$ rsautils rsa --encrypt --key=PUBLIC.PEM --input=PASSWORD.txt --output=PASSWORD.bin");
+                    Console.WriteLine("RSA ENCRYPTION EXAMPLE:");
+                    Console.WriteLine("$ gen --output=PRIVATE.pem");
+                    Console.WriteLine("$ pub --input=PRIVATE.pem --output=PUBLIC.pem");
+                    Console.WriteLine("$ pwd --output=PASSWORD.txt");
+                    Console.WriteLine("$ aes --encrypt --passfile=PASSWORD.txt --input=PLAIN.txt --output=CIPHERED.bin");
+                    Console.WriteLine("$ rsa --encrypt --key=PUBLIC.PEM --input=PASSWORD.txt --output=PASSWORD.bin");
                     Console.WriteLine();
-                    Console.WriteLine("DECRYPTION EXAMPLE:");
-                    Console.WriteLine("$ rsautils rsa --decrypt --pair=PRIVATE.PEM --input=PASSWORD.bin --output=PASSWORD.txt");
-                    Console.WriteLine("$ rsautils aes --decrypt --passfile=PASSWORD.txt --input=CIPHERED.bin --output=PLAIN.txt");
+                    Console.WriteLine("RSA DECRYPTION EXAMPLE:");
+                    Console.WriteLine("$ rsa --decrypt --pair=PRIVATE.PEM --input=PASSWORD.bin --output=PASSWORD.txt");
+                    Console.WriteLine("$ aes --decrypt --passfile=PASSWORD.txt --input=CIPHERED.bin --output=PLAIN.txt");
                 }
                 else if ((parser.Command != parser) && (parser.Command['?']))
                 {
                     switch (parser.Command.Name)
                     {
                         case "gen":
-                            Console.WriteLine($"RSAUTILS {parser.Command.Name} --output=<private-key-file> [--size=<key-size>]\r\n");
+                            Console.WriteLine($"PARAMETERS: {parser.Command.Name} --rsa|-ec --output=<private-key-file> [--length=<key-length>]\r\n");
                             Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
                             Console.WriteLine("OPENSSL EQUIVALENCE:");
-                            Console.WriteLine($"$ openssl genrsa <key-size> > <private-key-file>");
+                            Console.WriteLine($"$ openssl genrsa <key-length> > <private-key-file>");
                             break;
 
                         case "pub":
-                            Console.WriteLine($"RSAUTILS {parser.Command.Name} --input=<private-key-file> --output=<public-key-file>\r\n");
+                            Console.WriteLine($"PARAMETERS: {parser.Command.Name} --input=<private-key-file> --output=<public-key-file>\r\n");
                             Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
                             Console.WriteLine("OPENSSL EQUIVALENCE:");
                             Console.WriteLine($"$ openssl rsa -in <private-key-file> -pubout -out <public-key-file>");
                             break;
 
                         case "pwd":
-                            Console.WriteLine($"RSAUTILS {parser.Command.Name} --output=<password-file> [--length=<password-length>]\r\n");
+                            Console.WriteLine($"PARAMETERS: {parser.Command.Name} --output=<password-file> [--length=<password-length>]\r\n");
                             Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
                             Console.WriteLine("OPENSSL EQUIVALENCE:");
                             Console.WriteLine($"$ openssl rand -base64 <password-length> > <password-file>");
                             break;
 
+                        case "ecc":
+                            Console.WriteLine($"PARAMETERS: {parser.Command.Name} --yours=<private-key-file> --theirs=<public-key-file> --output=<password-file>\r\n");
+                            Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
+                            Console.Write("Generates a password (also called shared-secret or agreement) identical on both sides\x20");
+                            Console.WriteLine("using the Ellipic Curve's Diffie-Hellman algorithm");
+                            break;
+
                         case "rsa":
-                            Console.WriteLine($"RSAUTILS {parser.Command.Name} --encrypt|--decrypt --key=<public-key-file>|--pair=<key-pair-file> --input=<input-file> --output=<output-file>\r\n");
+                            Console.WriteLine($"PARAMETERS: {parser.Command.Name} --encrypt|--decrypt --key=<public-key-file>|--pair=<key-pair-file> --input=<input-file> --output=<output-file>\r\n");
                             Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
                             Console.WriteLine("OPENSSL EQUIVALENCE:");
                             Console.WriteLine($"ENCRYPT -> $ openssl rsautl -encrypt -oaep -inkey <public-key-file> -pubin -in <plain-file> -out <ciphered-file>");
@@ -126,7 +147,7 @@ namespace rsautils
                             break;
 
                         case "aes":
-                            Console.WriteLine($"RSAUTILS {parser.Command.Name} --encrypt|--decrypt --password=<password-file> --input=<input-file> --output=<output-file>\r\n");
+                            Console.WriteLine($"PARAMETERS: {parser.Command.Name} --encrypt|--decrypt --passfile=<password-file>|--base64=<BASE64-string>|--ascii=<ASCII-string> --input=<input-file> --output=<output-file>\r\n");
                             Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
                             Console.WriteLine("OPENSSL EQUIVALENCE:");
                             Console.WriteLine($"ENCRYPT -> $ openssl aes-256-cbc -e -md sha256 -in <plain-data> -out <ciphered-data> -kfile <password-file>");
@@ -142,11 +163,22 @@ namespace rsautils
                         {
                             case "gen":
                                 int size;
-                                if (!Int32.TryParse(gen_keysize.String, out size))
+                                if (gen_choice.Value == 'r')
                                 {
-                                    size = rsa_key_size;
+                                    if (!Int32.TryParse(gen_keysize.String, out size))
+                                    {
+                                        size = rsa_key_size;
+                                    }
+                                    RSAGenKey(gen_output.String, size);
                                 }
-                                GenKey(gen_output.String, size);
+                                else
+                                {
+                                    if (!Int32.TryParse(gen_keysize.String, out size))
+                                    {
+                                        size = ecc_key_size;
+                                    }
+                                    ECCGenKey(gen_output.String, size);
+                                }
                                 break;
 
                             case "pub":
@@ -160,6 +192,10 @@ namespace rsautils
                                     length = password_length;
                                 }
                                 GenPassword(pwd_output.String, length);
+                                break;
+
+                            case "sec":
+                                ECCAgreement(sec_skey_pub.String, sec_skey_prv.String, sec_output.String);
                                 break;
 
                             case "rsa":
@@ -176,11 +212,11 @@ namespace rsautils
                             case "aes":
                                 if (aes_choice.Value == 'e')
                                 {
-                                    AESEncrypt(aes_pwd_file.String, aes_pwd_str.String, aes_input.String, aes_output.String, aes_gzip.Switched);
+                                    AESEncrypt(aes_pwd_file.String, aes_pwd_b64.String, aes_pwd_str.String, aes_input.String, aes_output.String, aes_gzip.Switched);
                                 }
                                 else
                                 {
-                                    AESDecrypt(aes_pwd_file.String, aes_pwd_str.String, aes_input.String, aes_output.String, aes_gzip.Switched);
+                                    AESDecrypt(aes_pwd_file.String, aes_pwd_b64.String, aes_pwd_str.String, aes_input.String, aes_output.String, aes_gzip.Switched);
                                 }
                                 break;
 
@@ -211,14 +247,28 @@ namespace rsautils
             }
         }
 
-        private static void GenKey(string file_output, int key_size)
+        private static void RSAGenKey(string file_output, int key_size)
         {
             using (Stream stream_output = FileOrStandardOutput(file_output))
             using (StreamWriter stream_writer = new StreamWriter(stream_output, Encoding.ASCII))
             {
-                RsaKeyPairGenerator rsaKeyPairGnr = new RsaKeyPairGenerator();
-                rsaKeyPairGnr.Init(new KeyGenerationParameters(new SecureRandom(), key_size));
-                AsymmetricCipherKeyPair keyPair = rsaKeyPairGnr.GenerateKeyPair();
+                RsaKeyPairGenerator rsa_generator = new RsaKeyPairGenerator();
+                rsa_generator.Init(new KeyGenerationParameters(new SecureRandom(), key_size));
+                AsymmetricCipherKeyPair keyPair = rsa_generator.GenerateKeyPair();
+                PemWriter pem_writer = new PemWriter(stream_writer);
+                pem_writer.WriteObject(keyPair.Private);
+                pem_writer.Writer.Flush();
+            }
+        }
+
+        private static void ECCGenKey(string file_output, int key_size)
+        {
+            using (Stream stream_output = FileOrStandardOutput(file_output))
+            using (StreamWriter stream_writer = new StreamWriter(stream_output, Encoding.ASCII))
+            {
+                ECKeyPairGenerator elc_generator = new ECKeyPairGenerator();
+                elc_generator.Init(new KeyGenerationParameters(new SecureRandom(), key_size));
+                AsymmetricCipherKeyPair keyPair = elc_generator.GenerateKeyPair();
                 PemWriter pem_writer = new PemWriter(stream_writer);
                 pem_writer.WriteObject(keyPair.Private);
                 pem_writer.Writer.Flush();
@@ -259,9 +309,25 @@ namespace rsautils
             }
         }
 
+        private static void ECCAgreement(string file_akey_pub, string file_akey_prv, string file_output)
+        {
+            ECKeyParameters public_key = LoadPEMFile<ECKeyParameters>(file_akey_pub, default, false);
+            ECKeyParameters private_key = LoadPEMFile<ECKeyParameters>(default, file_akey_prv, true);
+            IBasicAgreement agreement = AgreementUtilities.GetBasicAgreement("ECDH");
+            agreement.Init(private_key);
+            BigInteger password = agreement.CalculateAgreement(public_key);
+
+            using (Stream stream_output = FileOrStandardOutput(file_output))
+            using (StreamWriter stream_writer = new StreamWriter(stream_output))
+            {
+                string str_password = Convert.ToBase64String(password.ToByteArray());
+                stream_writer.Write(str_password);
+            }
+        }
+
         private static void RSAEncrypt(string file_akey_pub, string file_akey_prv, string file_input, string file_output)
         {
-            RsaKeyParameters key_param = LoadPEMFile(file_akey_pub, file_akey_prv, false);
+            RsaKeyParameters key_param = LoadPEMFile<RsaKeyParameters>(file_akey_pub, file_akey_prv, false);
 
             using (Stream stream_input = FileOrStandardInput(file_input))
             using (Stream stream_output = FileOrStandardOutput(file_output))
@@ -275,29 +341,22 @@ namespace rsautils
 
         private static void RSADecrypt(string file_akey_prv, string file_input, string file_output)
         {
-            RsaKeyParameters key_param = LoadPEMFile(default, file_akey_prv, true);
+            RsaKeyParameters key_param = LoadPEMFile<RsaKeyParameters>(default, file_akey_prv, true);
 
             using (Stream stream_input = FileOrStandardInput(file_input))
             using (Stream stream_output = FileOrStandardOutput(file_output))
             using (AsymmetricCryptoStream stream_cripto = new AsymmetricCryptoStream(stream_output, new OaepEncoding(new RsaEngine(), new Sha1Digest(), new byte[0])))
             {
+
                 stream_cripto.Init(false, key_param);
                 stream_input.CopyTo(stream_cripto);
                 stream_cripto.Flush();
             }
         }
 
-        private static void AESEncrypt(string file_password, string str_password, string file_input, string file_output, bool compress)
+        private static void AESEncrypt(string file_password, string b64_password, string str_password, string file_input, string file_output, bool compress)
         {
-            if (String.IsNullOrWhiteSpace(str_password))
-            {
-                using (MemoryStream memory_password = new MemoryStream())
-                using (Stream stream_password = FileOrStandardInput(file_password))
-                {
-                    stream_password.CopyTo(memory_password);
-                    str_password = Encoding.ASCII.GetString(memory_password.ToArray());
-                }
-            }
+            byte[] password = LoadPassword(file_password, b64_password, str_password);
 
             using (Stream stream_input = FileOrStandardInput(file_input))
             using (Stream stream_output = FileOrStandardOutput(file_output))
@@ -306,7 +365,6 @@ namespace rsautils
                 using (GZipStream stream_gzip = new GZipStream(stream_cripto, CompressionMode.Compress))
                 {
                     int block_size = stream_cripto.BlockSize;
-                    byte[] password = Encoding.ASCII.GetBytes(str_password.Split('\r', '\n')[0]);
                     byte[] skey;
                     byte[] salt;
                     byte[] iv;
@@ -332,17 +390,9 @@ namespace rsautils
             }
         }
 
-        private static void AESDecrypt(string file_password, string str_password, string file_input, string file_output, bool uncompress)
+        private static void AESDecrypt(string file_password, string b64_password, string str_password, string file_input, string file_output, bool uncompress)
         {
-            if (String.IsNullOrWhiteSpace(str_password))
-            {
-                using (MemoryStream memory_password = new MemoryStream())
-                using (Stream stream_password = FileOrStandardInput(file_password))
-                {
-                    stream_password.CopyTo(memory_password);
-                    str_password = Encoding.ASCII.GetString(memory_password.ToArray());
-                }
-            }
+            byte[] password = LoadPassword(file_password, b64_password, str_password);
 
             using (Stream stream_output = FileOrStandardOutput(file_output))
             using (MemoryStream memory_stream = new MemoryStream())
@@ -362,7 +412,6 @@ namespace rsautils
                 using (Stream stream_input = FileOrStandardInput(file_input))
                 using (BufferedCryptoStream stream_cripto = new BufferedCryptoStream(stream_target, new PaddedBufferedBlockCipher(new CbcBlockCipher(new AesFastEngine()), new Pkcs7Padding())))
                 {
-                    byte[] password = Encoding.ASCII.GetBytes(str_password.Split('\r', '\n')[0]);
                     byte[] skey;
                     byte[] salt;
                     byte[] iv;
@@ -397,9 +446,9 @@ namespace rsautils
             }
         }
 
-        private static RsaKeyParameters LoadPEMFile(string file_akey_pub, string file_akey_prv, bool get_private)
+        private static T LoadPEMFile<T>(string file_akey_pub, string file_akey_prv, bool get_private) where T : AsymmetricKeyParameter
         {
-            RsaKeyParameters key_param;
+            T key_param;
 
             if (!String.IsNullOrWhiteSpace(file_akey_prv))
             {
@@ -411,11 +460,11 @@ namespace rsautils
 
                     if (get_private)
                     {
-                        key_param = (RsaKeyParameters)key_pair.Private;
+                        key_param = (T)key_pair.Private;
                     }
                     else
                     {
-                        key_param = (RsaKeyParameters)key_pair.Public;
+                        key_param = (T)key_pair.Public;
                     }
                 }
             }
@@ -425,7 +474,7 @@ namespace rsautils
                 using (StreamReader stream_reader = new StreamReader(stream_akey))
                 {
                     PemReader pem_reader = new PemReader(stream_reader);
-                    key_param = (RsaKeyParameters)pem_reader.ReadObject();
+                    key_param = (T)pem_reader.ReadObject();
                 }
             }
             else
@@ -434,6 +483,30 @@ namespace rsautils
             }
 
             return key_param;
+        }
+
+        private static byte[] LoadPassword(string file_password, string b64_password, string str_password)
+        {
+            if (!String.IsNullOrWhiteSpace(file_password))
+            {
+                using (Stream stream_password = FileOrStandardInput(file_password))
+                using (StreamReader stream_reader = new StreamReader(stream_password))
+                {
+                    return Convert.FromBase64String(stream_reader.ReadLine());
+                }
+            }
+            else if (!String.IsNullOrWhiteSpace(b64_password))
+            {
+                return Convert.FromBase64String(b64_password);
+            }
+            else if (!String.IsNullOrWhiteSpace(str_password))
+            {
+                return Encoding.ASCII.GetBytes(str_password);
+            }
+            else
+            {
+                throw new ArgumentNullException("password");
+            }
         }
 
         private static (byte[] key, byte[] iv) DeriveKey(byte[] password, byte[] salt, int key_size, int block_size)
