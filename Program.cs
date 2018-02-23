@@ -65,7 +65,7 @@ namespace rsautils
 
             var sec_skey_prv = parser_ecc.AddString('y', "yours", "your ECC private key file path");
             var sec_skey_pub = parser_ecc.AddString('t', "theirs", "the other part's ECC public key file path");
-            var sec_output = parser_ecc.AddString('o', "output 'shared-secret' BASE64 password file path");
+            var sec_output = parser_ecc.AddString('o', "output", "'shared-secret' BASE64 password file path");
 
             var rsa_akey_pub = parser_rsa.AddString('k', "key", "input public PEM file path");
             var rsa_akey_prv = parser_rsa.AddString('2', "pair", "input public+private pair PEM file path");
@@ -136,7 +136,7 @@ namespace rsautils
                             Console.WriteLine($"PARAMETERS: {parser.Command.Name} --yours=<private-key-file> --theirs=<public-key-file> --output=<password-file>\r\n");
                             Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
                             Console.WriteLine("OPENSSL EQUIVALENCE:");
-                            Console.WriteLine("$ openssl pkeyutl -derive -inkey <private-key_file> -peerkey <public-key-file> -out <password-file>");
+                            Console.WriteLine("$ openssl pkeyutl -derive -inkey <private-key-file> -peerkey <public-key-file> | base64 > <password-file>");
                             break;
 
                         case "rsa":
