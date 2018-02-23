@@ -53,7 +53,7 @@ namespace rsautils
 
             var gen_output = parser_gen.AddString('o', "output", "output file path");
             var gen_keysize = parser_gen.AddString('l', "length", $"key bit-length (default RSA={rsa_key_size} EC={ecc_key_size})");
-            var gen_choice = parser_gen.AddChoice('r', "asimmetric cryptosystem algorithm (default RSA)");
+            var gen_choice = parser_gen.AddChoice('r', "asymmetric cryptosystem algorithm (default RSA)");
             gen_choice.AddItem('r', "rsa", "RSA (Rivest-Shamir-Adleman)");
             gen_choice.AddItem('e', "ecc", "Elliptic Curve Cryptography");
 
@@ -82,8 +82,8 @@ namespace rsautils
             var aes_output = parser_aes.AddString('o', "output", "output data file path");
             var aes_gzip = parser_aes.AddOption('z', "gzip", "enable GZIP compression/decompression");
             var aes_choice = parser_aes.AddChoice('e', "operation mode (default: encrypt)");
-            aes_choice.AddItem('e', "encrypt", "AES-256 cipher with password file");
-            aes_choice.AddItem('d', "decrypt", "AES-256 decipher with password file");
+            aes_choice.AddItem('e', "encrypt", "AES-256 cipher");
+            aes_choice.AddItem('d', "decrypt", "AES-256 decipher");
 
             Console.OutputEncoding = Encoding.ASCII;
 
@@ -114,7 +114,8 @@ namespace rsautils
                             Console.WriteLine($"PARAMETERS: {parser.Command.Name} --rsa|-ec --output=<private-key-file> [--length=<key-length>]\r\n");
                             Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
                             Console.WriteLine("OPENSSL EQUIVALENCE:");
-                            Console.WriteLine($"$ openssl genrsa <key-length> > <private-key-file>");
+                            Console.WriteLine($"RSA -> $ openssl genrsa <key-length> -out <private-key-file>");
+                            Console.WriteLine($"ECC -> $ openssl ecparam -name <e.g. prime256v1> -genkey -noout -out <private-key-file>");
                             break;
 
                         case "pub":
@@ -134,8 +135,8 @@ namespace rsautils
                         case "ecc":
                             Console.WriteLine($"PARAMETERS: {parser.Command.Name} --yours=<private-key-file> --theirs=<public-key-file> --output=<password-file>\r\n");
                             Console.WriteLine(parser.Command.HelpTextBuilder(4, false).ToString());
-                            Console.Write("Generates a password (also called shared-secret or agreement) identical on both sides\x20");
-                            Console.WriteLine("using the Ellipic Curve's Diffie-Hellman algorithm");
+                            Console.WriteLine("OPENSSL EQUIVALENCE:");
+                            Console.WriteLine("$ openssl pkeyutl -derive -inkey <private-key_file> -peerkey <public-key-file> -out <password-file>");
                             break;
 
                         case "rsa":
@@ -194,7 +195,7 @@ namespace rsautils
                                 GenPassword(pwd_output.String, length);
                                 break;
 
-                            case "sec":
+                            case "ecc":
                                 ECCAgreement(sec_skey_pub.String, sec_skey_prv.String, sec_output.String);
                                 break;
 
