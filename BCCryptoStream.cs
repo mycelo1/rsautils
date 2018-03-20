@@ -87,8 +87,11 @@ namespace Org.BouncyCastle.Crypto.Stream
         public override void Init(bool forEncryption, ICipherParameters parameters)
             => base_cipher.Init(forEncryption, parameters);
 
-        public override int GetOutputSize(int inputLen) => throw new NotSupportedException();
-        public override int GetBlockSize() => throw new NotSupportedException();
+        public override int GetOutputSize(int inputLen)
+            => base_cipher.GetOutputBlockSize();
+
+        public override int GetBlockSize()
+            => base_cipher.GetInputBlockSize();
 
         protected override byte[] ProcessBytes(byte[] buffer, int offset, int count)
             => base_cipher.ProcessBlock(buffer, offset, count);
